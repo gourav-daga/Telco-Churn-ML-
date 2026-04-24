@@ -25,42 +25,94 @@ Production Deployment:
 """
 
 import os
-import pandas as pd
+from pathlib import Path
+
 import mlflow
+import pandas as pd
 
-# === MODEL LOADING CONFIGURATION ===
-# IMPORTANT: This path is set during Docker container build
-# In development: uses local MLflow artifacts
-# In production: uses model copied to container at build time
-MODEL_DIR = "/app/model"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DOCKER_MODEL_DIR = Path("/app/model")
 
-try:
-    # Load the trained XGBoost model in MLflow pyfunc format
-    # This ensures compatibility regardless of the underlying ML library
-    model = mlflow.pyfunc.load_model(MODEL_DIR)
-    print(f"✅ Model loaded successfully from {MODEL_DIR}")
-except Exception as e:
-    print(f"❌ Failed to load model from {MODEL_DIR}: {e}")
-    # Fallback for local development (OPTIONAL)
-    try:
-        # Try loading from local MLflow tracking
-        import glob
-        local_model_paths = glob.glob("./mlruns/*/*/artifacts/model")
-        if local_model_paths:
-            latest_model = max(local_model_paths, key=os.path.getmtime)
-            model = mlflow.pyfunc.load_model(latest_model)
-            MODEL_DIR = latest_model
-            print(f"✅ Fallback: Loaded model from {latest_model}")
-        else:
-            raise Exception("No model found in local mlruns")
-    except Exception as fallback_error:
-        raise Exception(f"Failed to load model: {e}. Fallback failed: {fallback_error}")
+
+def _candidate_model_dirs() -> list[Path]:
+    """
+    Build model search paths in priority order.
+
+    Priority:
+    1. Explicit MODEL_DIR env var
+    2. Docker path (/app/model)
+    3. Checked-in local runs under src/serving/model
+    4. Local MLflow tracking runs under ./mlruns
+    """
+    candidates: list[Path] = []
+
+    env_model_dir = os.getenv("MODEL_DIR")
+    if env_model_dir:
+        candidates.append(Path(env_model_dir))
+
+    candidates.append(DOCKER_MODEL_DIR)
+
+    checked_in = sorted(
+        (PROJECT_ROOT / "src" / "serving" / "model").glob("*/artifacts/model"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    candidates.extend(checked_in)
+
+    mlruns = sorted(
+        (PROJECT_ROOT / "mlruns").glob("*/*/artifacts/model"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    candidates.extend(mlruns)
+
+    return candidates
+
+
+def _load_model():
+    last_error = None
+
+    for model_dir in _candidate_model_dirs():
+        if not model_dir.exists():
+            continue
+        try:
+            loaded_model = mlflow.pyfunc.load_model(str(model_dir))
+            print(f"✅ Model loaded successfully from {model_dir}")
+            return loaded_model, model_dir
+        except Exception as e:
+            last_error = e
+            print(f"❌ Failed to load model from {model_dir}: {e}")
+
+    searched = [str(p) for p in _candidate_model_dirs()]
+    raise RuntimeError(
+        f"Failed to load model from all candidate paths: {searched}. Last error: {last_error}"
+    )
+
+
+def _resolve_feature_file(model_dir: Path) -> Path:
+    # Docker layout: /app/model/feature_columns.txt
+    # Local run layout: .../artifacts/model + sibling .../artifacts/feature_columns.txt
+    candidates = [
+        model_dir / "feature_columns.txt",
+        model_dir.parent / "feature_columns.txt",
+    ]
+
+    for feature_file in candidates:
+        if feature_file.exists():
+            return feature_file
+
+    raise FileNotFoundError(
+        f"feature_columns.txt not found for model dir {model_dir}. Checked: {[str(p) for p in candidates]}"
+    )
+
+
+model, MODEL_DIR = _load_model()
 
 # === FEATURE SCHEMA LOADING ===
 # CRITICAL: Load the exact feature column order used during training
 # This ensures the model receives features in the expected order
 try:
-    feature_file = os.path.join(MODEL_DIR, "feature_columns.txt")
+    feature_file = _resolve_feature_file(MODEL_DIR)
     with open(feature_file) as f:
         FEATURE_COLS = [ln.strip() for ln in f if ln.strip()]
     print(f"✅ Loaded {len(FEATURE_COLS)} feature columns from training")
